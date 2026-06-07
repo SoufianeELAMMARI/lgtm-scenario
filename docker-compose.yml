@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# One-command local observability scenario.
+#   - lgtm    : the whole backend (Grafana + Loki + Tempo + Prometheus + OTel
+#               Collector) in ONE container, persisting to ONE volume.
+#   - app     : a small instrumented demo service (emits traces/logs/metrics,
+#               fails ~10% of requests so SLO / error-budget is meaningful).
+#   - loadgen : sends continuous traffic so you see data immediately.
+#
+# Run:   docker compose up -d --build
+# Open:  http://localhost:3000        (Grafana, no login)
+# Stop:  docker compose down          (keep data)
+#        docker compose down -v       (wipe the volume / reset)
+# ---------------------------------------------------------------------------
+
+services:
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: lgtm
+    ports:
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC  (apps send telemetry here)
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - lgtm-data:/data    # <-- the single volume (persists across restarts)
+
+  app:
+    build: ./app
+    container_name: demo-app
+    depends_on:
+      - lgtm
+    ports:
+      - "5001:5000"   # hit it yourself: http://localhost:5001/rolldice
+    environment:
+      OTEL_SERVICE_NAME: demo-app
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"   # push metrics every 5s (fast feedback)
+
+  loadgen:
+    image: curlimages/curl:latest
+    container_name: loadgen
+    depends_on:
+      - app
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "loadgen: waiting for app to start..."
+        sleep 10
+        echo "loadgen: sending traffic"
+        while true; do
+          curl -s http://app:5000/rolldice > /dev/null
+          curl -s http://app:5000/         > /dev/null
+          curl -s http://app:5000/slow     > /dev/null
+          sleep 1
+        done
+
+volumes:
+  lgtm-data:
